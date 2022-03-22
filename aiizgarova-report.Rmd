@@ -1,0 +1,229 @@
+---
+title: 'Проект SQL: Анализ оттока клиентов банка'
+author: "Изгарова Анна, aiizgarova"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning=FALSE, echo = F, comment='')
+```
+
+## Задача
+
+Отток клиентов банка. Требуется определить, с чем связано то, что клиенты не заключают новые договоры. Tакже необходимо предложить вариант - как сократить уход клиентов. Удержания клиентов, повышения их уровня лояльности важно для сбережения ресурсов на привлечение новых клиентов.
+
+## Анализ
+
+### Данные и логика анализа
+
+В отчете используются данные из базы данных MariaDB --> dbname='bank'. Подключение к ним происходит при помощи SQL.
+```{r}
+library(DBI)
+library(RMariaDB)
+library(RSQLite)
+library(tidyverse)
+library(tidymodels)
+library(RColorBrewer)
+library(vip)
+library(plotly)
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user='studentminor', 
+                 password='DataMinorHSE!2020', 
+                 dbname='bank', 
+                 host='34.88.193.134',
+                 port = 3306)
+```
+
+Используя SQL-запрос, посмотрим на пропорцию оттока клиентов:
+
+
+```{r}
+knitr::kable(dbGetQuery(con, "SELECT Exited, COUNT(*) AS count FROM portfolio GROUP BY Exited") %>% summarise(Exited = Exited, proportion = count/sum(count)),align = 'l',col.names = c("Уход клиента","Доля от общего количества"))
+```
+Около 20% клиентов уходят.  
+Можно предположить, что этот показатель будет различаться в зависимости от географии. Тогда можно рассмотреть задачу сокращения оттока клиентов по конкретной стране, чтобы найти какой-то наиболее подверженный риску филиал банка.      
+Рассмотрим распределение, полученное из данных так же при помощи SQL-запроса: 
+```{r}
+outflow_contries =dbGetQuery(con,
+"SELECT Country, Exited
+FROM profile 
+INNER JOIN portfolio ON portfolio.CustomerId=profile.CustomerId 
+INNER JOIN country ON profile.CountryId=country.CountryId") %>% group_by(Country, Exited) %>%  summarise(n = n())
+
+```
+
+```{r}
+
+plot_ly(
+  x = c("Франция", "Германия", "Испания"),
+  y = c(round(810/(4204+810),2), round(814/(1695+814),2), round(413/(2064+413),2)),
+  name = "Страны",
+  type = "bar") %>% 
+  layout(title = "Отток клиентов в зависимости от страны",
+         xaxis = list(title = ""),
+         yaxis = list(title = "Доля оттока"))
+
+
+```
+В Германии клиенты банка уходят чаще. Для сужения анализа следует выбрать группу клиентов, чья страна указана как "Германия". 
+
+## Модель
+Для предсказания оттока строятся две модели. Их точности сравниваются и выбирается лучшая модель из двух. Из базы данных выгружаются выборка резидентов Германии, выбираются только необходимые для анализа переменные. Данные разбиваются на тестовую и обучающую выборки. 
+Что касается технической подготовки данных: устраняются скоррелированные количественные переменные, категориальные преобразуются в дамми-переменные, данные нормируются, некоторые - логарифмируются.
+
+```{r}
+germany = dbGetQuery(con, "SELECT 
+Gender,Age,EstimatedSalary,CreditScore,Tenure,Balance,
+NumOfProducts,HasCrCard,IsActiveMember,Exited
+FROM profile 
+INNER JOIN portfolio ON portfolio.CustomerId=profile.CustomerId 
+INNER JOIN country ON profile.CountryId=country.CountryId
+WHERE Country = 'Germany'") 
+
+dbDisconnect(con)
+```
+
+```{r}
+# меняю типы
+# germany = germany %>% mutate_if(as.character, as.factor)
+germany$Gender = as.factor(germany$Gender)
+germany$HasCrCard = as.factor(germany$HasCrCard)
+germany$IsActiveMember = as.factor(germany$IsActiveMember)
+germany$Exited = as.factor(germany$Exited)
+```
+
+```{r}
+# Разбиваю на тестовую и обучающую выборки
+germany_split <- initial_split(germany, 
+                            prop = 0.7, 
+                            strata = Exited)
+
+germany_training <- germany_split %>% training()
+germany_test <- germany_split %>% testing()
+```
+
+```{r}
+#подготовка данных
+germany_recipe = recipe(Exited~., data =germany_training) %>% 
+  step_corr(all_numeric(), threshold = 0.8) %>% 
+  step_log(c(EstimatedSalary, Balance)) %>%
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+```
+Для оценки качества моделей используются метрики: sensitivity, specificity, roc_auc.
+
+```{r}
+# Create a custom metric function
+germany_metrics <- metric_set(sens, spec, roc_auc)
+```
+
+#### Логистическая регрессия
+```{r}
+# создаю логистическую регрессию
+logistic_model <- logistic_reg() %>% 
+  set_engine('glm') %>% 
+  set_mode('classification')
+
+# создаю воркфлоу
+germany_wkfl <- workflow() %>% 
+  add_model(logistic_model) %>% 
+  add_recipe(germany_recipe)
+ 
+# тренирую воркфлоу
+germany_wkfl_fit <- germany_wkfl %>%
+  last_fit(split = germany_split)
+
+# собираю предсказания
+# germany_wkfl_fit  %>%  collect_predictions()
+
+# вычисляю metrics cet
+knitr::kable(germany_metrics(germany_wkfl_fit  %>% collect_predictions(),
+                truth = Exited,
+                estimate = .pred_class,  
+                .pred_0),align = 'l',col.names = c("Метрика","Estimator","Estimate"))
+```
+
+
+#### Дерево 
+```{r}
+dt_model <- decision_tree() %>% 
+  set_engine('rpart') %>% 
+  set_mode('classification')
+
+# создаю воркфлоу
+germany_tree_wkfl <- workflow() %>% 
+  add_model(dt_model) %>% 
+  add_recipe(germany_recipe)
+ 
+# тренирую воркфлоу
+germany_tree_fit <- germany_tree_wkfl %>%
+  last_fit(split = germany_split)
+
+# вычисляю metrics set
+knitr::kable(germany_metrics(germany_tree_fit %>% collect_predictions(), 
+                truth = Exited,
+                estimate = .pred_class,  
+                .pred_0),align = 'l',col.names = c("Метрика","Estimator","Estimate"))
+```
+
+Судя по ROC_AUC дерево в нашем случае предсказывает отток лучше логистической регрессии. Выбираем дерево.
+
+### Симуляция
+
+Следует предложить меры сокращения оттока, а также смоделировать их внедрение, чтобы выяснить, становятся ли клиенты более лояльными. Для этого произведем оценку важности каждой переменной, влияющей на итог:  
+
+```{r}
+library(vip)
+germany_tree_fit %>%
+  extract_fit_parsnip() %>%
+  vip(aesthetics = list(fill = "steelblue3"))+
+  theme_bw()
+```
+
+  
+Из графика видно, что важным оказалось количество продуктов банка, используемых клиентом (2-я строка).
+
+#### Предложение:
+Рекоммендовать клиентам новые продукты - повысить количество продуктов, которыми пользуется клиент (кредитов, карт, счетов). Например, заключить страховку, открыть инвестиционный счет, сберегательный счет или подключиться к мобильному оператору банка. Это должно повысить лояльность клиента и увеличить издержки клиента на выход из экосистемы банка. 
+
+
+Поэкспериментируем. Попробуем предложить 1 продукт банка клиентам, которые сейчас пользуются только одним продуктом банка. Считаем, что с вероятностью 7% клиенты соглашаются пользоваться этим +1 продуктом.   
+
+```{r}
+test_exp = germany_test
+
+test_exp$NumOfProducts[test_exp$NumOfProducts == 1 ] = 
+  sample(c(1, 2), 
+  size = length(test_exp$NumOfProducts[test_exp$NumOfProducts == 1 ]),
+  replace = T, prob = c(0.93, 0.07))
+
+germ_fit = fit(germany_tree_wkfl,germany_training)
+
+predTest = predict(germ_fit, test_exp)$.pred_class
+ggplot(data.frame(predTest)) + 
+  geom_bar(aes(x = predTest), alpha = 0.5, fill = "red") +
+  geom_bar(data = germany_test, aes(x = Exited), alpha = 0.5, fill ='gray79') + 
+  xlab("Exited")+
+  theme_bw()+
+  xlab("Ушел ли клиент?")+
+  scale_x_discrete(labels = c("нет","да"))+
+  ylab("Количество клиентов")+
+  ggtitle('                  Изменение в оттоке клиентов после нововведения')
+  
+
+```
+
+Новое значение изображено красным, прежнее - серым. Как видно, отток клиентов в Германии сокращается, если предлагать им дополнительный продукт банка. 
+
+<!-- ### Дэшборд -->
+
+<!-- <Какую часть анализа вы выносите в дэшборд. Для кого ваш дэшборд> -->
+
+## Общие выводы
+
+Цель работы заключалась в предсказании оттока клиентов банка. В ходе работы была выбрана группа клиентов, относящихся территориально к Германии. На основании данных о точности двух моделей (логистическая регрессия и дерево) было принято решение использовать дерево в качестве предсказательной модели. Выяснилось, что значимым сигналом оттока клиентов является низкое количество продуктов банка, которыми пользуется клиент. Поэтому было выдвинуто предложение рекоммендовать клиентам, которые пользуются только 1 продуктом, еще +1 дополнительно. Была смоделирована ситуация, когда клиенты соглашаются в 7% случаев. Такое нововведение дало положительную динамику: клиенты стали уходить меньше.Таким образом, был обнаружен действенный способ снизить отток клиентов - предлагать им дополнительные продукты банка. Это повысит лояльность и удержит клиентов.  
+
+
+  

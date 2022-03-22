@@ -1,0 +1,199 @@
+---
+title: "Проект SQL: Анализ оттока клиентов банка"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+---
+
+```{r setup, include=FALSE}
+library(DBI)
+library(RMariaDB)
+library(RSQLite)
+library(tidyverse)
+library(tidymodels)
+library(RColorBrewer)
+library(vip)
+library(plotly)
+library(flexdashboard)
+library(tidyverse)
+library(wordcloud2)
+library(crosstalk)
+con <- dbConnect(RMariaDB::MariaDB(), 
+                 user='studentminor', 
+                 password='DataMinorHSE!2020', 
+                 dbname='bank', 
+                 host='34.88.193.134',
+                 port = 3306)
+```
+
+
+ 
+Column {data-width=250}
+-----------------------------------------------------------------------
+### Текущий отток клиентов
+```{r}
+
+prop = dbGetQuery(con, "SELECT Exited, COUNT(*) AS count FROM portfolio GROUP BY Exited") %>% summarise(Exited = Exited, proportion = count/sum(count))
+
+valueBox(paste(prop[1,2]*100,"%",sep=''), color = "#FF8373")
+```
+
+### По странам:
+```{r}
+outflow_contries =dbGetQuery(con,
+"SELECT Country, Exited
+FROM profile 
+INNER JOIN portfolio ON portfolio.CustomerId=profile.CustomerId 
+INNER JOIN country ON profile.CountryId=country.CountryId") %>% group_by(Country, Exited) %>%  summarise(n = n())
+
+plot_ly(
+  x = c("Франция", "Германия", "Испания"),
+  y = c(round(810/(4204+810),2), round(814/(1695+814),2), round(413/(2064+413),2)),
+  name = "Страны",
+  type = "bar") %>% 
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "Доля оттока"))
+
+```
+
+### Отток в Германии
+```{r}
+prop = outflow_contries %>% filter(Country=="Germany")
+
+valueBox(paste(round(prop[2,3]*100/(prop[1,3]+prop[2,3]),2),"%", sep=''), icon = "sort-amount-down", color = "#FF5640")
+```
+
+Column  {data-width=375}
+-----------------------------------------------------------------------
+
+### Характеристики клиента, оказывающие значимое влияние на решение уйти/остаться
+```{r}
+germany = dbGetQuery(con, "SELECT 
+Gender,Age,EstimatedSalary,CreditScore,Tenure,Balance,
+NumOfProducts,HasCrCard,IsActiveMember,Exited
+FROM profile 
+INNER JOIN portfolio ON portfolio.CustomerId=profile.CustomerId 
+INNER JOIN country ON profile.CountryId=country.CountryId
+WHERE Country = 'Germany'") 
+
+dbDisconnect(con)
+```
+
+```{r}
+# меняю типы
+# germany = germany %>% mutate_if(as.character, as.factor)
+germany$Gender = as.factor(germany$Gender)
+germany$HasCrCard = as.factor(germany$HasCrCard)
+germany$IsActiveMember = as.factor(germany$IsActiveMember)
+germany$Exited = as.factor(germany$Exited)
+```
+
+```{r}
+# Разбиваю на тестовую и обучающую выборки
+germany_split <- initial_split(germany, 
+                            prop = 0.7, 
+                            strata = Exited)
+
+germany_training <- germany_split %>% training()
+germany_test <- germany_split %>% testing()
+```
+
+```{r}
+#подготовка данных
+germany_recipe = recipe(Exited~., data =germany_training) %>% 
+  step_corr(all_numeric(), threshold = 0.8) %>% 
+  step_log(c(EstimatedSalary, Balance)) %>%
+  step_normalize(all_numeric()) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+```
+
+```{r}
+# Create a custom metric function
+germany_metrics <- metric_set(sens, spec, roc_auc)
+```
+
+
+```{r}
+# создаю логистическую регрессию
+logistic_model <- logistic_reg() %>% 
+  set_engine('glm') %>% 
+  set_mode('classification')
+
+# создаю воркфлоу
+germany_wkfl <- workflow() %>% 
+  add_model(logistic_model) %>% 
+  add_recipe(germany_recipe)
+ 
+# тренирую воркфлоу
+germany_wkfl_fit <- germany_wkfl %>%
+  last_fit(split = germany_split)
+
+# собираю предсказания
+# germany_wkfl_fit  %>%  collect_predictions()
+
+
+```
+
+
+```{r}
+dt_model <- decision_tree() %>% 
+  set_engine('rpart') %>% 
+  set_mode('classification')
+
+# создаю воркфлоу
+germany_tree_wkfl <- workflow() %>% 
+  add_model(dt_model) %>% 
+  add_recipe(germany_recipe)
+ 
+# тренирую воркфлоу
+germany_tree_fit <- germany_tree_wkfl %>%
+  last_fit(split = germany_split)
+
+
+```
+
+
+
+```{r}
+library(vip)
+germany_tree_fit %>%
+  extract_fit_parsnip() %>%
+  vip(aesthetics = list(fill = "steelblue3"))+
+  theme_bw()
+```
+
+### Клиентам, использующим 1 продукт банка
+```{r}
+valueBox(value ="Предлагать +1 продукт",icon="far fa-comment-dots",color = "#6C8CD5")
+```
+
+
+ 
+Column {data-width=375}
+-----------------------------------------------------------------------
+### Симуляция: предложения +1 продукта банка
+
+
+```{r}
+Exited <- c("клиент остался", "клиент ушел")
+last <- c(509, 245)
+current <- c(591, 163)
+
+data <- data.frame(Exited , last , current)
+
+data <- SharedData$new(data)
+filter_checkbox("Exited", "Статус", data, ~Exited)
+
+fig <- plot_ly(data, x = ~Exited, y = ~last, type = 'bar', name = 'До', marker = list(color = 'rgb(158,202,225)'))
+fig <- fig %>% add_trace(y = ~current, name = 'После', marker = list(color = 'rgb(74,147,187)'))
+fig <- fig %>% layout(yaxis = list(title = 'Количество'), barmode = 'group')
+
+fig
+```
+
+### Значение оттока в Германии после симуляции изменения
+```{r}
+valueBox(paste(round(163*100/(591+163),2),"%",sep=''), color = "#FF8373")
+```
+
+
